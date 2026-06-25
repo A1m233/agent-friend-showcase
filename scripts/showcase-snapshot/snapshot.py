@@ -377,16 +377,29 @@ HTTP/SSE bridge、语音控制面，以及 Tauri + React 桌面前端。
 ./scripts/setup/run.sh
 cp .env.example .env
 # 在 .env 中填入必要的模型服务 key
-./scripts/cli/run.sh
 ```
 
-运行 web 调试版桌面界面：
+启动桌面端：
+
+```bash
+./scripts/dev/run.sh
+```
+
+这会同时启动本地 bridge 和 Tauri 桌面前端。首次运行会编译 Rust，时间会稍长。
+
+如果只想快速验证聊天窗口，也可以使用浏览器调试模式：
 
 ```bash
 ./scripts/dev/run.sh --web
 ```
 
 然后打开 `http://localhost:1420/chat.html`。
+
+命令行调试入口是可选的：
+
+```bash
+./scripts/cli/run.sh
+```
 
 公开版 `.env.example` 默认关闭 IM 和厂商集成，并把本地运行数据放在
 `.agent-friend-data/` 下。填入 LLM provider key 后即可试用对话；可选厂商集成

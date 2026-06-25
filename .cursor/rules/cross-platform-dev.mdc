@@ -1,0 +1,62 @@
+---
+description: agent-friend 项目跨平台开发支持与 scripts/ 规范
+alwaysApply: true
+---
+
+# 跨平台开发支持
+
+本项目支持 **mac/linux** 和 **windows** 两端开发。**任何"非写代码"的操作必须通过 `scripts/` 提供脚本**——开发者只应该接触：写代码 + 跑 `./scripts/{name}/run.{sh|ps1}`，不需要记忆 `uv run python -m ...` 这种长命令。
+
+## 强制约定（必读）
+
+1. 启动服务、依赖安装、运行测试、lint、构建、清理等操作 → 加到 `scripts/{name}/` 下
+2. 每个脚本必须**同时**提供 `run.sh`（mac/linux）和 `run.ps1`（windows）两个版本
+3. 两端脚本**语义一致、输出格式尽量一致**，避免一边能跑一边跑不通
+4. 新增脚本后必须在 `scripts/README.md` 加一行表格说明（名字 / 用途 / mac 用法 / win 用法）
+5. 现有脚本若改了行为，同步更新 `scripts/README.md` 和两个 `run.*` 文件
+6. **不要让开发者直接记忆** `uv run python -m ...` / `pytest` / `mypy ...` 等命令——这些必须被 `scripts/{name}/` 包装
+
+## 双端覆盖的例外
+
+§强制约定第 2 条"必须同时提供 sh 和 ps1"在以下情况允许只做单端：
+
+- 脚本针对**特定平台的环境兼容 / 绕路问题**（如 macOS 上某个安全工具注入代理变量），另一平台暂未发现同类问题
+- 脚本**专供 coding-agent 自动化使用**（如 `*.agent.sh`），且 agent 自身实际只在某一端运行
+
+走例外的硬性要求：
+
+1. 必须在 `scripts/README.md` 显眼位置说明：单端事实、适用平台、为什么不提供另一端
+2. 脚本首部注释写清楚用途与"另一端没做"的原因
+3. 一旦另一端撞到同类问题，必须补齐双端，本例外失效
+
+## 脚本编写规范
+
+### bash (`run.sh`)
+
+- 文件首行：`#!/usr/bin/env bash`
+- 必须 `set -euo pipefail`
+- 必须 `cd "$(dirname "$0")/../.."` 切换到项目根
+- 文件需要 `chmod +x` 可执行权限
+- 透传参数用 `"$@"`，最终执行用 `exec uv run ...`（让 shell 替换为 uv 进程）
+
+### PowerShell (`run.ps1`)
+
+- 文件首行：`$ErrorActionPreference = "Stop"`
+- 必须 `Set-Location (Join-Path $PSScriptRoot "..\..")` 切换到项目根
+- 透传参数用 `@args`
+- **文件编码：含非 ASCII 字符（如中文注释）的 `.ps1` 必须存成 UTF-8 **with BOM**。** Windows PowerShell 5.1 读取无 BOM 脚本时按系统 ANSI 代码页（中文系统 = GBK）解析，会把中文错位拼出多余的 `}` / `` ` `` 导致解析失败；加 BOM 后 PS 5.1 / PS 7 / mac/linux 三端都能正确读（`chcp 65001` 无法替代，PS 5.1 读无 BOM 脚本固定用 ANSI 代码页）。
+- **输出编码：脚本顶部（`$ErrorActionPreference` 之后）必须设一行强制 UTF-8 输出**：`$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)`。否则 PS 5.1 默认按系统 ANSI/GBK 编码写控制台，而现代终端（Cursor / Windows Terminal）按 UTF-8 渲染，中文会全是乱码（与上一条「读」无关，这是「写」的问题）。
+
+## 不应擅自做的事
+
+- **不要在脚本里自动安装系统级工具**（uv、git 等）。要么检测到缺失就友好提示安装命令并退出，要么由开发者手动装
+- **不要在脚本里改 PowerShell execution policy** 或其他系统级设置；遇到问题在 `scripts/README.md` 显眼处提示开发者怎么改
+
+## 例外
+
+仅以下情况允许"非写代码"操作不进 `scripts/`：
+
+- 一次性的 git 操作（commit、merge、branch 切换等）
+- 调试代码时的临时一次性命令
+
+> 任何**会重复 ≥ 2 次**的操作，都应该被脚本化。

@@ -1,0 +1,96 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "agent-friend",
+  "version": "0.1.0",
+  "identifier": "com.agentfriend.desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "pet",
+        "url": "pet.html",
+        "title": "agent-friend",
+        "width": 240,
+        "height": 320,
+        "resizable": false,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false,
+        "fullscreen": false
+      },
+      {
+        "label": "bubble",
+        "url": "bubble.html",
+        "title": "agent-friend-bubble",
+        "width": 280,
+        "height": 96,
+        "resizable": false,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false,
+        "fullscreen": false,
+        "visible": false,
+        "focus": false
+      },
+      {
+        "label": "chat",
+        "url": "chat.html",
+        "title": "agent-friend · 对话",
+        "width": 720,
+        "height": 640,
+        "resizable": true,
+        "visible": false,
+        "fullscreen": false
+      },
+      {
+        "label": "settings",
+        "url": "settings.html",
+        "title": "agent-friend · 设置",
+        "width": 720,
+        "height": 640,
+        "resizable": true,
+        "visible": false,
+        "fullscreen": false
+      },
+      {
+        "label": "memory-inspector",
+        "url": "memory-inspector.html",
+        "title": "agent-friend · 记忆面板",
+        "width": 1024,
+        "height": 720,
+        "minWidth": 800,
+        "minHeight": 560,
+        "resizable": true,
+        "visible": false,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "android": {
+      "debugApplicationIdSuffix": ".debug"
+    }
+  }
+}

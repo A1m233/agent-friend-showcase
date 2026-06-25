@@ -1,0 +1,58 @@
+---
+description: agent-friend 前端 UI 编写规范：组件复用与设计 token CSS 变量化
+globs: frontend/**
+alwaysApply: false
+---
+
+# 前端 UI 编写规范
+
+约束在 `frontend/` 下编写界面代码时的两条硬性规范，保证 UI 一致性与可换肤。
+
+## 交互件一律用封装组件，禁止散写原生件
+
+- 通用纯 UI 件 = 无业务逻辑、无 store 依赖、只吃 props 的展示型组件（button / input / select / textarea / modal / tag 等）。需要时：
+  - 已存在于 `src/components/ui/` → 直接复用。
+  - 不存在 → 在 `src/components/ui/` 新建：**引入 shadcn 组件必须走 CLI（`pnpm dlx shadcn@latest add`），禁止手写 / 手抄后声称是 shadcn 源码；完整流程（怎么定组件 / 拉取 / 适配 token 与目录）见 skill `add-shadcn-component`**。仅当 shadcn 没有对应件时才自写项目纯 UI 件（注释标明「非 shadcn、自写」）。再 import 引用。
+- 对话域组件（消息列表 / 气泡 / sender 等）用 `@tdesign-react/chat` 散件，不自造。
+- 页面 / 业务代码里**不出现原生交互元素**。这条不靠"自觉"或"占位/MVP 也不例外"这类措辞维持，而是由机械门禁判定：
+  - ESLint `react/forbid-elements` 见到 `<button>` / `<input>` 等原生交互件即报错，接入 `scripts/check`、合 main 前必过、IDE 内即时报错；门禁**不认**"临时 / 占位 / MVP"理由。
+  - `src/components/ui/` 内部豁免该门禁——封装件本就要包原生件。
+  - 规则只讲"该怎么写"，"写错了拦下来"交给门禁。
+- 页面私有、带业务的组件不在"通用件"约束内，按既有目录约定放 `pages/<页>/components/`。
+
+## 设计 token：禁止硬编码，统一走 CSS 变量
+
+设计 token = 颜色 / 字体栈 / 字号 / 字重 / 行高 / 字间距 / 间距 / 圆角 / 阴影 / 动效时长 / 缓动 等所有视觉常量。一律走 CSS 变量，禁止硬编码，目的是 UI 一致性 + 可换肤 + 后续调整时一处改全局动。
+
+### 禁止形式（适用于所有 token 维度，不只颜色）
+
+- **CSS / 内联 style 里的裸字面值**：`color: #1677ff` / `font-family: "Inter"` / `font-size: 16px` / `padding: 12px` / `border-radius: 8px` / `box-shadow: 0 2px 4px ...` 等。
+- **Tailwind arbitrary value（带 `[...]` 的工具类）**：`text-[#333]` / `text-[16px]` / `font-[600]` / `leading-[1.5]` / `p-[12px]` / `rounded-[8px]` / `shadow-[...]` 等一律不写。
+- **Tailwind 内置色板类**：`bg-red-500` / `text-blue-600` 这类跟随 Tailwind 默认色板而非项目主题。
+- **例外（合法用法）**：**已映射到项目 token** 的 Tailwind 工具类（如 `bg-accent` / `text-fg` / `border-border`），以及走 `--spacing` 单位 token 的 `p-4` / `gap-6` 这类。即"工具类背后是项目变量"就行，"工具类背后是 Tailwind 默认值"就不行。
+
+### token 放哪：随主题 vs 不随主题
+
+`src/styles/theme/` 下分两类，新增 token 前先判断属于哪类：
+
+- **随主题变** = 颜色、阴影（阴影颜色随主题）、选中态背景等带色样式
+  → `theme/light.css` / `theme/dark.css`（以及未来新增的主题文件），**同名、值不同**。
+  新增此类 token 时**必须所有主题文件都补**，否则换肤会有漏。
+- **不随主题变** = 字体栈、字号、字重、行高、字间距、间距、圆角、动效时长、缓动等纯尺度量
+  → `theme/tokens.css`（**首次需要时建立此文件**，挂在 `:root` 上）。仅一份，所有主题共用。
+
+新增 token 同步在 `src/styles/index.css` 的 `@theme inline` 块里映射成 Tailwind token（如 `--text-base: var(--font-size-base)` / `--radius-md: var(--radius-md)`），让 `text-base` / `rounded-md` 这类工具类直接走变量，否则 utility class 只能用 arbitrary value 写——又会触发禁止形式。
+
+### 命名
+
+- 语义优先：`--accent` / `--surface` / `--space-md` 而不是 `--blue-500` / `--12px`。
+- 成尺度的用 `-xs / -sm / -md / -lg / -xl` 层级，不跳号、不混用 `-1 / -2 / -3` 数字风。
+
+### 机械门禁
+
+颜色已由 `frontend/scripts/check-colors.mjs`（接入 `scripts/check`）覆盖：扫 `src/`，命中色板类 / `#hex` / `rgb()/hsl()` / 任意值色即报错。其他维度（字号 / 字重 / 行高 / 字间距 / 间距 / 圆角 / 阴影）由 `frontend/scripts/check-design-tokens.mjs`（接入 `scripts/check`）覆盖。`src/styles/theme/` 作为 token 定义源头、`src/components/ui/` 作为 shadcn vendored 区域，对本节约束与所有 token 维度门禁永久豁免：
+
+- `src/styles/theme/` —— token 定义源头，硬编码是必然。
+- `src/components/ui/` —— shadcn 官方源码，通过 `pnpm dlx shadcn@latest add` 拉取后原样保留；其内部 arbitrary value 多为几何 calc 与组件专属 magic，不是项目级设计常量，改动会与上游 CLI 更新冲突。新增 shadcn 组件后无需为其内部 token 做适配，仅外层使用方按本规则约束。
+
+规则只讲"该怎么写"，"写错了拦下来"交给门禁。

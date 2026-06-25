@@ -1,0 +1,19 @@
+/* dark 主题：与其它主题文件保持变量同名、值不同（见 frontend-ui-conventions 规则）。 */
+html[theme="dark"] {
+  --bg: #0f0f10;
+  --surface: #1a1b1e;
+  --fg: #f5f5f5;
+  --muted: #9ca3af;
+  --accent: #818cf8;
+  --accent-fg: #0f0f10;
+  --border: #2a2c31;
+  --success: #22c55e;
+  --danger: #ef4444;
+  --warning: #f59e0b;
+
+  /* 阴影（dark 主题加深透明度，深色背景下更可见） */
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.3);
+  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.4), 0 2px 4px -2px rgb(0 0 0 / 0.4);
+  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.4), 0 4px 6px -4px rgb(0 0 0 / 0.4);
+  --shadow-2xl: 0 25px 50px -12px rgb(0 0 0 / 0.6);
+}

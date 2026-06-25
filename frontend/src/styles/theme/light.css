@@ -1,0 +1,19 @@
+/* light 主题：与其它主题文件保持变量同名、值不同（见 frontend-ui-conventions 规则）。 */
+html[theme="light"] {
+  --bg: #ffffff;
+  --surface: #f5f6f8;
+  --fg: #1a1a1a;
+  --muted: #6b7280;
+  --accent: #4f46e5;
+  --accent-fg: #ffffff;
+  --border: #e5e7eb;
+  --success: #16a34a;
+  --danger: #dc2626;
+  --warning: #d97706;
+
+  /* 阴影（值 = Tailwind v4 默认 light，保证视觉零变化） */
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+  --shadow-2xl: 0 25px 50px -12px rgb(0 0 0 / 0.25);
+}

@@ -1,6 +1,6 @@
 # Showcase Snapshot Scan Report
 
-- Generated: `2026-06-28T07:59:50.189684+00:00`
+- Generated: `2026-06-28T08:18:44.747009+00:00`
 - Copied files: `633`
 - Errors: `0`
 - Warnings: `58`

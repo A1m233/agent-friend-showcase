@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import * as PIXI from "pixi.js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Priority } from "easy-live2d";
@@ -11,7 +10,8 @@ import { DevPassthroughToggle } from "./DevPassthroughToggle";
 import { IMConnectDialog } from "@/components/im/IMConnectDialog";
 import { usePixiAvatarSlot } from "./usePixiAvatarSlot";
 import { usePetPassthrough } from "./usePetPassthrough";
-import { usePetInteractions } from "./usePetInteractions";
+import { usePetInteractions, type PetInteractionCallbacks } from "./usePetInteractions";
+import { useLive2DDebugBridge } from "./useLive2DDebugBridge";
 import { usePetLive2D } from "@/pet/usePetLive2D";
 import { PET_LIVE2D_CONFIG } from "@/pet/live2dConfig";
 import { TextCadenceMouthDriver } from "@/pet/MouthDriver";
@@ -20,6 +20,11 @@ import {
   usePetStateStore,
   type PetPhase,
 } from "@/stores/petState";
+import {
+  focusVoiceCallWindow,
+  useVoiceStore,
+} from "@/stores/voice";
+import { isVoiceCallLive } from "@/stores/voiceStateMachine";
 
 /**
  * Tauri listener stale-cleanup race 兜底：StrictMode 双 mount / hot reload 期间 Tauri 内部
@@ -66,13 +71,15 @@ export function PetApp() {
   const [passthroughDisabled, setPassthroughDisabled] = useState(false);
   // 022 · IM 接入面板 dialog 开关(同窗 dialog,不另开 webview)
   const [imDialogOpen, setImDialogOpen] = useState(false);
+  const voicePhase = useVoiceStore((s) => s.phase);
+  const requestStartVoice = useVoiceStore((s) => s.requestStartFromAnyWindow);
 
   // 17a · PIXI lifecycle + avatar slot Container + drag + sprite world position 上报
   // anchor / hitArea / spriteScreen 自动从 alpha-scan 推（一次锁定 visible bounds，不抖）；
   // invalidateAnchor 由 usePetLive2D 在 Live2DSprite ready 后调用，让 anchor 重新扫到真 Hiyori bounds
   // 024 · interactionsRef 延迟绑定：usePixiAvatarSlot 比 usePetLive2D/usePetInteractions 早调用，
   // 但 callbacks 又依赖 spriteRef/driver。用 ref 在 hooks 顺序合法的前提下做延迟绑定。
-  const interactionsRef = useRef<{ onSlotClick: (e: PIXI.FederatedPointerEvent) => void; onSlotDragMove: (vx: number, vy: number) => void } | null>(null);
+  const interactionsRef = useRef<PetInteractionCallbacks | null>(null);
 
   const { slotRef, app, invalidateAnchor, alphaScanGivenUpRef } = usePixiAvatarSlot(
     stageRef,
@@ -106,13 +113,19 @@ export function PetApp() {
   }, [driver, spriteRef]);
 
   // 024 · 鼠标输入反馈（gaze / tap / drag）集中调度
-  const { onSlotClick, onSlotDragMove } = usePetInteractions(
+  const { onSlotClick, onSlotDragMove, debugControls } = usePetInteractions(
     spriteRef,
     spriteReady,
     spriteScreen,
     isDragging,
     driver,
   );
+
+  useLive2DDebugBridge({
+    spriteRef,
+    spriteReady,
+    debugControls,
+  });
 
   // 把 callbacks 回填给 slot handler
   useEffect(() => {
@@ -283,6 +296,22 @@ export function PetApp() {
     void invoke("open_memory_inspector");
   };
 
+  const openLive2DDebugger = () => {
+    if (!isTauri()) return;
+    console.info("[pet] open_live2d_debugger requested");
+    void invoke("open_live2d_debugger")
+      .then(() => console.info("[pet] open_live2d_debugger completed"))
+      .catch((error) => console.warn("[pet] open_live2d_debugger failed:", error));
+  };
+
+  const startVoiceCall = () => {
+    if (isVoiceCallLive(voicePhase)) {
+      void focusVoiceCallWindow();
+      return;
+    }
+    void requestStartVoice();
+  };
+
   // 016 M16.9 · dev-only：手动注入测试气泡，跳过 bridge / 真 LLM，方便纯 GUI 验证。
   // release build 时 import.meta.env.DEV=false，整段被 ActionBar 内部 tree-shake 掉。
   const injectShort = () => {
@@ -320,7 +349,10 @@ export function PetApp() {
           onHidePet={hidePet}
           onOpenSettings={openSettings}
           onOpenIMConnect={() => setImDialogOpen(true)}
+          onStartVoiceCall={startVoiceCall}
+          voiceCallActive={isVoiceCallLive(voicePhase)}
           onOpenMemoryInspector={openMemoryInspector}
+          onOpenLive2DDebugger={openLive2DDebugger}
           onInjectShort={injectShort}
           onInjectLong={injectLong}
         />

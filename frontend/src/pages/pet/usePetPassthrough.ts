@@ -1,10 +1,40 @@
-import { useEffect, type RefObject } from "react";
+import { useEffect, useRef, type RefObject } from "react";
 import type * as PIXI from "pixi.js";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { isTauri } from "@/utils/tauri";
 import { slotBoundsHit } from "./slotBoundsHit";
 import { alphaHitTest } from "@/pet/petAlphaHitTest";
+
+type PassthroughReason =
+  | "disabled"
+  | "initial"
+  | "dragging"
+  | "dom-hit"
+  | "sprite-hit"
+  | "sprite-transparent"
+  | "outside";
+
+const PET_PASSTHROUGH_DEBUG_STORAGE_KEY = "agent-friend.debug.pet-passthrough";
+
+function describeHitTarget(el: Element | null): string | null {
+  if (!el) return null;
+
+  const tag = el.tagName.toLowerCase();
+  const id = el.id ? `#${el.id}` : "";
+  const dataHit = el.getAttribute("data-hit");
+  const dataHitPart = dataHit ? `[data-hit=${dataHit}]` : "[data-hit]";
+  return `${tag}${id}${dataHitPart}`;
+}
+
+function shouldLogPassthroughDiagnostic(): boolean {
+  if (!import.meta.env.DEV) return false;
+  try {
+    return window.localStorage.getItem(PET_PASSTHROUGH_DEBUG_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
 
 /**
  * 透明窗鼠标穿透 hit-test（M10.2 spike → 17a 升级到 PIXI 整屏 overlay 形态 → 18 升级到 alpha hit-test）。
@@ -79,67 +109,121 @@ export function usePetPassthrough({
   setCursorOnSprite,
   disabled = false,
 }: Options) {
+  const latestRef = useRef({
+    isDragging,
+    spriteScreen,
+    app,
+    alphaScanGivenUpRef,
+    setCursorOnSprite,
+  });
+  latestRef.current = {
+    isDragging,
+    spriteScreen,
+    app,
+    alphaScanGivenUpRef,
+    setCursorOnSprite,
+  };
+
   useEffect(() => {
     if (!isTauri()) return; // 浏览器 web 调试下无桌面能力，跳过
 
     const win = getCurrentWindow();
     let ignored: boolean | null = null;
     let disposed = false;
+    let lastDiagnosticKey: string | null = null;
 
-    const apply = (shouldIgnore: boolean) => {
-      if (shouldIgnore === ignored) return; // 只在变化时切，避免抖动
+    const apply = (
+      shouldIgnore: boolean,
+      reason: PassthroughReason,
+      details: Record<string, unknown> = {},
+    ) => {
+      if (shouldLogPassthroughDiagnostic()) {
+        const diagnosticKey = `${shouldIgnore}:${reason}`;
+        if (diagnosticKey !== lastDiagnosticKey) {
+          lastDiagnosticKey = diagnosticKey;
+          console.debug("[pet][passthrough]", {
+            ignored: shouldIgnore,
+            reason,
+            ...details,
+          });
+        }
+      }
+      if (shouldIgnore === ignored) return;
       ignored = shouldIgnore;
-      void win.setIgnoreCursorEvents(shouldIgnore);
+      void win.setIgnoreCursorEvents(shouldIgnore).catch(() => {});
     };
 
     // dev-only · 禁穿透分支：让 inspector / dev tools 鼠标事件正常
     if (disabled) {
-      apply(false);
-      setCursorOnSprite(false);
+      apply(false, "disabled");
+      latestRef.current.setCursorOnSprite(false);
       return () => {
         disposed = true;
+        // Fail open: pet 是整屏透明 overlay，异常卸载/HMR 后必须恢复点击穿透，
+        // 否则透明窗口会变成吃掉全桌面点击的实窗。
+        void win
+          .setIgnoreCursorEvents(true)
+          .catch((error) => console.warn("[pet][passthrough] cleanup fail-open failed:", error));
+        latestRef.current.setCursorOnSprite(false);
       };
     }
 
-    apply(true); // 初始默认穿透：空白处不挡桌面
+    apply(true, "initial"); // 初始默认穿透：空白处不挡桌面
 
     const unlisten = listen<{ x: number; y: number }>("pet://cursor", (e) => {
       if (disposed) return;
+      const latest = latestRef.current;
       // (1) drag 期间锁定 false；hover 状态从 cursorOnSprite 维度看是 "不算 hover"
       //     （但 ActionBar 显隐由 App.tsx 综合 isDragging || cursorOnSprite || hoverActionBarDom 决定）
-      if (isDragging) {
-        setCursorOnSprite(false);
-        return apply(false);
+      if (latest.isDragging) {
+        latest.setCursorOnSprite(false);
+        return apply(false, "dragging", { cursor: e.payload });
       }
       // (2) DOM data-hit 优先（操作栏 DOM 在 canvas 之上）
       const el = document.elementFromPoint(e.payload.x, e.payload.y);
-      if (el?.closest("[data-hit]")) {
+      const hitTarget = el?.closest("[data-hit]") ?? null;
+      if (hitTarget) {
         setCursorOnSprite(false); // cursor 在 ActionBar 上，不在 sprite 上
-        return apply(false);
+        return apply(false, "dom-hit", {
+          cursor: e.payload,
+          target: describeHitTarget(hitTarget),
+        });
       }
       // (3) sprite alpha hit-test 主路径（18 升级；spriteScreen 矩形作 fast reject）
       //     18b · alphaScanGivenUpRef 标记 Win mixed DPR 下 readPixels 不可用 → 跳过 alpha 关，
       //     矩形命中即生效（= 17a 行为，cursor 进 slot.getBounds 矩形就视为命中 Hiyori）。
-      if (spriteScreen && slotBoundsHit(e.payload, spriteScreen)) {
-        const hit = alphaScanGivenUpRef.current
+      if (latest.spriteScreen && slotBoundsHit(e.payload, latest.spriteScreen)) {
+        const spriteDetails = {
+          cursor: e.payload,
+          spriteScreen: latest.spriteScreen,
+          alphaScanGivenUp: latest.alphaScanGivenUpRef.current,
+          hasPixiApp: Boolean(latest.app),
+        };
+        const hit = latest.alphaScanGivenUpRef.current
           ? true // Win mixed DPR mitigation：跳过 alpha 关
-          : app
-            ? alphaHitTest(app, e.payload)
+          : latest.app
+            ? alphaHitTest(latest.app, e.payload)
             : true; // app 未就绪时退化到矩形（17a 兜底，加载早期）
         if (hit) {
           setCursorOnSprite(true);
-          return apply(false);
+          return apply(false, "sprite-hit", spriteDetails);
         }
+        setCursorOnSprite(false);
+        return apply(true, "sprite-transparent", spriteDetails);
       }
       setCursorOnSprite(false);
-      apply(true);
+      apply(true, "outside", { cursor: e.payload });
     });
 
     return () => {
       disposed = true;
       void unlisten.then((f) => f());
-      void win.setIgnoreCursorEvents(false);
-      setCursorOnSprite(false);
+      // Fail open: cleanup 可能来自 React error boundary / HMR，而 pet 窗是整屏透明 overlay。
+      // `true` = 忽略鼠标事件，让点击穿透到桌面，避免异常退出后锁住其它应用窗口。
+      void win
+        .setIgnoreCursorEvents(true)
+        .catch((error) => console.warn("[pet][passthrough] cleanup fail-open failed:", error));
+      latestRef.current.setCursorOnSprite(false);
     };
-  }, [isDragging, spriteScreen, app, setCursorOnSprite, disabled]);
+  }, [disabled, setCursorOnSprite]);
 }

@@ -27,12 +27,15 @@ Note:
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Literal
+from hashlib import sha256
+from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import uuid4
 
 from llm_providers import (
@@ -59,6 +62,7 @@ from .conversation_events import (
     TurnDone,
 )
 from .errors import AgentError
+from .latency import VoiceLatencyContext, log_voice_latency, monotonic_ms
 from .messages import Message
 from .personas import PersonaCatalog
 from .prompts import PromptBuilder
@@ -83,6 +87,20 @@ MAX_TOOL_TURNS_DEFAULT = 5
 
 详见 docs/requirements/005-engine-tool-calling-and-web-search/design.md §4.6.3。
 """
+
+_RECALL_PAST_CHATS_TOOL_NAME = "recall_past_chats"
+_CURRENT_SESSION_ID_ARG = "__agent_friend_current_session_id"
+_CURRENT_TURN_START_INDEX_ARG = "__agent_friend_current_turn_start_index"
+logger = logging.getLogger(__name__)
+_UNSET = object()
+
+
+@dataclass(frozen=True)
+class _RewritePlan:
+    target_user_uuid: str
+    target_user_content: str
+    inactive_event_uuids: list[str]
+    prefix_events: list[Event]
 
 
 def _resolve_max_tool_turns() -> int:
@@ -156,11 +174,33 @@ class Conversation:
         # 有效窗口 / 触发阈值），供调试入口读取（AC-1.3）。
         self._last_input_tokens: int | None = None
         self._last_context_notes: dict[str, Any] = {}
+        self._voice_latency_context: VoiceLatencyContext | None = None
+        self._voice_latency_short_reply_hint = ""
+        self._voice_latency_llm_overrides: dict[str, Any] = {}
+        self._voice_latency_disable_tools = False
         # 007 起 ``_system_prompt`` 不再缓存——每次调用 :attr:`_current_system_prompt`
         # 让 :class:`agent.system_prompt.ChannelSection` 等动态 section 在 channel
         # 切换后立刻生效。``__init__`` 时仍 build 一次做客户端预检（persona 不存在
         # 等错误尽早暴露）。
         prompt_builder.build()
+
+    def set_voice_latency_context(
+        self,
+        context: VoiceLatencyContext | None,
+        *,
+        short_reply_hint: str = "",
+        llm_overrides: dict[str, Any] | None = None,
+        disable_tools: bool = False,
+    ) -> None:
+        """Attach optional per-round voice latency context.
+
+        Non-voice callers never set this, so the existing text / AG-UI paths do
+        not emit voice latency logs.
+        """
+        self._voice_latency_context = context
+        self._voice_latency_short_reply_hint = short_reply_hint if context is not None else ""
+        self._voice_latency_llm_overrides = dict(llm_overrides or {}) if context is not None else {}
+        self._voice_latency_disable_tools = disable_tools if context is not None else False
 
     # ----- 只读视图 -----
 
@@ -306,6 +346,7 @@ class Conversation:
 
         user_event_appended = False
         current_text_buf: list[str] = []
+        current_text_persisted = False
         current_tc_acc: dict[int, dict[str, Any]] = {}
         total_tool_calls = 0
         turn_start_idx = len(self._session.events)
@@ -313,6 +354,7 @@ class Conversation:
         try:
             for turn_idx in range(self._max_tool_turns + 1):
                 current_text_buf = []
+                current_text_persisted = False
                 current_tc_acc = {}
 
                 if turn_idx == 0:
@@ -320,11 +362,42 @@ class Conversation:
                 else:
                     openai_messages = self._build_openai_messages_continuation()
 
-                tool_specs = self._tool_registry.to_openai_tools() if self._tool_registry else None
+                tool_specs = (
+                    None
+                    if self._voice_latency_disable_tools
+                    else self._tool_registry.to_openai_tools()
+                    if self._tool_registry
+                    else None
+                )
 
                 stop_reason = ""
-                for ev in self._llm_client.stream(openai_messages, tools=tool_specs):
+                llm_start_ms = monotonic_ms()
+                log_voice_latency(
+                    logger,
+                    self._voice_latency_context,
+                    "agent_llm_stream_start",
+                    session_id=self._session.session_id,
+                    turn_idx=turn_idx,
+                    tools=bool(tool_specs),
+                )
+                first_text_seen = False
+                for ev in self._llm_client.stream(
+                    openai_messages,
+                    tools=tool_specs,
+                    **self._voice_latency_llm_overrides,
+                ):
                     if isinstance(ev, LLMTextDelta):
+                        if not first_text_seen:
+                            first_text_seen = True
+                            log_voice_latency(
+                                logger,
+                                self._voice_latency_context,
+                                "agent_first_llm_text_delta",
+                                session_id=self._session.session_id,
+                                turn_idx=turn_idx,
+                                elapsed_ms=monotonic_ms() - llm_start_ms,
+                                chars=len(ev.text),
+                            )
                         current_text_buf.append(ev.text)
                         yield TextDelta(text=ev.text)
                     elif isinstance(ev, LLMToolCallDelta):
@@ -347,6 +420,7 @@ class Conversation:
                     persona_id=persona_id,
                     model=model_snapshot,
                 )
+                current_text_persisted = True
 
                 if not tool_calls or stop_reason != "tool_use":
                     yield TurnDone(stop_reason="end_turn", total_tool_calls=total_tool_calls)
@@ -366,7 +440,11 @@ class Conversation:
                     )
 
                     start = time.monotonic()
-                    result = self._invoke_tool_safely(tc["name"], tc["args"])
+                    result = self._invoke_tool_safely(
+                        tc["name"],
+                        tc["args"],
+                        current_turn_start_idx=turn_start_idx,
+                    )
                     duration = time.monotonic() - start
 
                     self._append_tool_call_result_event(tc, result, duration)
@@ -394,6 +472,7 @@ class Conversation:
                     user_input=user_input,
                     user_event_appended=user_event_appended,
                     current_text_buf=current_text_buf,
+                    current_text_persisted=current_text_persisted,
                     persona_name=persona_name,
                     persona_id=persona_id,
                     model_snapshot=model_snapshot,
@@ -402,6 +481,175 @@ class Conversation:
                 if not self._post_turn_external:
                     # 014: 默认行为保留——AgentRuntime 装配时 post_turn_external=True，
                     # 由 PostTurn hook 调 memory.observe；此处不重复触发
+                    self._observe_turn(turn_start_idx)
+
+    def edit_resend_latest(
+        self,
+        user_input: str,
+        *,
+        expected_user_content: str | None = None,
+    ) -> Iterator[ConversationEvent]:
+        """编辑并重发最后一条 active user 消息。
+
+        原始事件流保持 append-only；成功启动新分支后追加 ``turn_rewrite`` marker，
+        让旧最后一轮在 active projection 中失活。首轮 LLM 初始化失败时不追加 marker，
+        保持用户可重试的干净状态。
+        """
+        plan = self._latest_active_user_rewrite_plan(expected_user_content=expected_user_content)
+
+        persona_name = self._session.current_persona_name
+        persona_id = self._session.current_persona_id
+        model_snapshot = self._session.current_model
+
+        self._invalidate_rewrite_memory(plan.inactive_event_uuids)
+
+        prefix_history = self._messages_from_events(plan.prefix_events)
+        prefix_prior_summary = self._derive_prior_summary_from_events(plan.prefix_events)
+
+        rewrite_event_appended = False
+        user_event_appended = False
+        current_text_buf: list[str] = []
+        current_text_persisted = False
+        current_tc_acc: dict[int, dict[str, Any]] = {}
+        total_tool_calls = 0
+        turn_start_idx = len(self._session.events)
+
+        try:
+            for turn_idx in range(self._max_tool_turns + 1):
+                current_text_buf = []
+                current_text_persisted = False
+                current_tc_acc = {}
+
+                if turn_idx == 0:
+                    openai_messages = self._build_openai_messages_first_turn(
+                        user_input,
+                        history_override=prefix_history,
+                        prior_summary_override=prefix_prior_summary,
+                        persist_compaction=False,
+                    )
+                else:
+                    openai_messages = self._build_openai_messages_continuation()
+
+                tool_specs = (
+                    None
+                    if self._voice_latency_disable_tools
+                    else self._tool_registry.to_openai_tools()
+                    if self._tool_registry
+                    else None
+                )
+
+                stop_reason = ""
+                llm_start_ms = monotonic_ms()
+                log_voice_latency(
+                    logger,
+                    self._voice_latency_context,
+                    "agent_llm_stream_start",
+                    session_id=self._session.session_id,
+                    turn_idx=turn_idx,
+                    tools=bool(tool_specs),
+                )
+                first_text_seen = False
+                for ev in self._llm_client.stream(
+                    openai_messages,
+                    tools=tool_specs,
+                    **self._voice_latency_llm_overrides,
+                ):
+                    if isinstance(ev, LLMTextDelta):
+                        if not first_text_seen:
+                            first_text_seen = True
+                            log_voice_latency(
+                                logger,
+                                self._voice_latency_context,
+                                "agent_first_llm_text_delta",
+                                session_id=self._session.session_id,
+                                turn_idx=turn_idx,
+                                elapsed_ms=monotonic_ms() - llm_start_ms,
+                                chars=len(ev.text),
+                            )
+                        current_text_buf.append(ev.text)
+                        yield TextDelta(text=ev.text)
+                    elif isinstance(ev, LLMToolCallDelta):
+                        self._accumulate_tool_call_delta(current_tc_acc, ev)
+                    elif isinstance(ev, LLMTurnDone):
+                        stop_reason = ev.stop_reason
+                        self._consume_usage(ev)
+
+                if not rewrite_event_appended:
+                    self._append_turn_rewrite_event(plan, replacement_text=user_input)
+                    rewrite_event_appended = True
+
+                if not user_event_appended:
+                    self._append_user_event(user_input)
+                    user_event_appended = True
+
+                tool_calls = self._finalize_tool_calls(current_tc_acc)
+
+                self._append_assistant_event(
+                    "".join(current_text_buf),
+                    partial=False,
+                    persona_name=persona_name,
+                    persona_id=persona_id,
+                    model=model_snapshot,
+                )
+                current_text_persisted = True
+
+                if not tool_calls or stop_reason != "tool_use":
+                    yield TurnDone(stop_reason="end_turn", total_tool_calls=total_tool_calls)
+                    return
+
+                if turn_idx >= self._max_tool_turns:
+                    break
+
+                for tc in tool_calls:
+                    self._append_tool_call_request_event(tc)
+                    yield ToolCallRequest(
+                        tool_call_id=tc["id"],
+                        tool_name=tc["name"],
+                        args=tc["args"],
+                    )
+
+                    start = time.monotonic()
+                    result = self._invoke_tool_safely(
+                        tc["name"],
+                        tc["args"],
+                        current_turn_start_idx=turn_start_idx,
+                    )
+                    duration = time.monotonic() - start
+
+                    self._append_tool_call_result_event(tc, result, duration)
+                    yield ToolCallResult(
+                        tool_call_id=tc["id"],
+                        tool_name=tc["name"],
+                        text=result.text,
+                        is_error=result.is_error,
+                        duration_seconds=duration,
+                    )
+                    total_tool_calls += 1
+
+            yield from self._finalize_on_tool_loop_limit(
+                persona_name=persona_name,
+                persona_id=persona_id,
+                model_snapshot=model_snapshot,
+                total_tool_calls=total_tool_calls,
+            )
+        finally:
+            exc_info = sys.exc_info()
+            interrupted = exc_info[0] is not None
+            if interrupted:
+                if not rewrite_event_appended and (user_event_appended or current_text_buf):
+                    self._append_turn_rewrite_event(plan, replacement_text=user_input)
+                    rewrite_event_appended = True
+                self._on_interrupt(
+                    user_input=user_input,
+                    user_event_appended=user_event_appended,
+                    current_text_buf=current_text_buf,
+                    current_text_persisted=current_text_persisted,
+                    persona_name=persona_name,
+                    persona_id=persona_id,
+                    model_snapshot=model_snapshot,
+                )
+            else:
+                if not self._post_turn_external:
                     self._observe_turn(turn_start_idx)
 
     # ----- 系统级触发轮（014：main loop 入口） -----
@@ -631,6 +879,70 @@ class Conversation:
 
     # ----- 内部辅助 -----
 
+    def _latest_active_user_rewrite_plan(
+        self,
+        *,
+        expected_user_content: str | None,
+    ) -> _RewritePlan:
+        active_events = self._session.active_events
+        target_idx: int | None = None
+        for idx in range(len(active_events) - 1, -1, -1):
+            if active_events[idx].type == "user_message":
+                target_idx = idx
+                break
+        if target_idx is None:
+            raise AgentError("当前会话没有可编辑重发的用户消息")
+
+        target = active_events[target_idx]
+        content = target.payload.get("content", "")
+        if not isinstance(content, str):
+            content = ""
+        if expected_user_content is not None and content != expected_user_content:
+            raise AgentError("最后一条用户消息已变化，请刷新后再编辑重发")
+
+        inactive = [ev.uuid for ev in active_events[target_idx:]]
+        return _RewritePlan(
+            target_user_uuid=target.uuid,
+            target_user_content=content,
+            inactive_event_uuids=inactive,
+            prefix_events=list(active_events[:target_idx]),
+        )
+
+    def _messages_from_events(self, events: list[Event]) -> list[Message]:
+        """按 ``Session.messages`` 规则投影指定事件前缀。"""
+        if not events:
+            return []
+        return Session.from_events(list(events)).messages
+
+    def _invalidate_rewrite_memory(self, inactive_event_uuids: list[str]) -> None:
+        if self._memory is None or not inactive_event_uuids:
+            return
+        self._memory.invalidate_sources(
+            session_id=self._session.session_id,
+            event_uuids=set(inactive_event_uuids),
+            reason="edit_resend_latest",
+        )
+
+    def _append_turn_rewrite_event(
+        self,
+        plan: _RewritePlan,
+        *,
+        replacement_text: str,
+    ) -> None:
+        event = Event(
+            type="turn_rewrite",
+            uuid=str(uuid4()),
+            ts=datetime.now(UTC),
+            payload={
+                "reason": "edit_resend_latest",
+                "target_user_uuid": plan.target_user_uuid,
+                "inactive_event_uuids": list(plan.inactive_event_uuids),
+                "replacement_text_sha256": sha256(replacement_text.encode("utf-8")).hexdigest(),
+            },
+        )
+        self._store.append_event(self._session.session_id, event)
+        self._session.append(event)
+
     def _append_user_event(self, content: str) -> None:
         event = Event(
             type="user_message",
@@ -663,7 +975,14 @@ class Conversation:
         self._store.append_event(self._session.session_id, event)
         self._session.append(event)
 
-    def _build_openai_messages_first_turn(self, user_input: str) -> list[dict[str, Any]]:
+    def _build_openai_messages_first_turn(
+        self,
+        user_input: str,
+        *,
+        history_override: list[Message] | None = None,
+        prior_summary_override: PriorSummary | None | object = _UNSET,
+        persist_compaction: bool = True,
+    ) -> list[dict[str, Any]]:
         """工具调用循环第 0 轮：通过统一入口 :meth:`_assemble` 把 ``user_input``
         作为最新一条 user 消息组装。
 
@@ -672,15 +991,51 @@ class Conversation:
         """
         extra: list[Message] | None = None
         if self._memory is not None:
+            memory_start_ms = monotonic_ms()
+            log_voice_latency(
+                logger,
+                self._voice_latency_context,
+                "agent_memory_retrieve_start",
+                session_id=self._session.session_id,
+            )
             ctx = self._memory.retrieve(
                 user_input,
                 persona_id=self._session.current_persona_id or "",
                 session_id=self._session.session_id,
             )
+            log_voice_latency(
+                logger,
+                self._voice_latency_context,
+                "agent_memory_retrieve_done",
+                session_id=self._session.session_id,
+                elapsed_ms=monotonic_ms() - memory_start_ms,
+                empty=ctx.is_empty(),
+            )
             self._last_memory_context = ctx
             if not ctx.is_empty():
                 extra = [Message(role="system", content=ctx.rendered)]
-        return self._assemble(new_user_input=user_input, extra_context=extra)
+        if self._voice_latency_short_reply_hint:
+            extra = [
+                *(extra or []),
+                Message(role="system", content=self._voice_latency_short_reply_hint),
+            ]
+        assemble_start_ms = monotonic_ms()
+        result = self._assemble(
+            new_user_input=user_input,
+            extra_context=extra,
+            history_override=history_override,
+            prior_summary_override=prior_summary_override,
+            persist_compaction=persist_compaction,
+        )
+        log_voice_latency(
+            logger,
+            self._voice_latency_context,
+            "agent_context_assemble_done",
+            session_id=self._session.session_id,
+            elapsed_ms=monotonic_ms() - assemble_start_ms,
+            messages=len(result),
+        )
+        return result
 
     def _assemble(
         self,
@@ -689,6 +1044,9 @@ class Conversation:
         extra_context: list[Message] | None = None,
         trailing_user: str | None = None,
         trailing_system: str | None = None,
+        history_override: list[Message] | None = None,
+        prior_summary_override: PriorSummary | None | object = _UNSET,
+        persist_compaction: bool = True,
     ) -> list[dict[str, Any]]:
         """统一所有发往 LLM 的上下文组装入口（009 R-0.3）。
 
@@ -705,9 +1063,9 @@ class Conversation:
         Returns:
             可直接喂给 :meth:`LLMClient.stream` / ``complete`` 的 OpenAI 风格 dict 列表。
         """
-        runtime = self._build_runtime_context()
+        runtime = self._build_runtime_context(prior_summary_override=prior_summary_override)
         build = self._context_manager.build_messages(
-            history=self._session.messages,
+            history=self._session.messages if history_override is None else history_override,
             system_prompt=self._system_prompt,
             new_user_input=new_user_input,
             extra_context=extra_context,
@@ -716,12 +1074,16 @@ class Conversation:
             runtime=runtime,
         )
         # 009 M3：context manager 只"生成"摘要，落盘 IO 在此执行（职责边界，design §4.3）。
-        if build.new_compaction is not None:
+        if persist_compaction and build.new_compaction is not None:
             self._append_compaction_event(build.new_compaction)
         self._record_context_notes(build, runtime)
         return [m.to_openai() for m in build.messages]
 
-    def _build_runtime_context(self) -> RuntimeContext:
+    def _build_runtime_context(
+        self,
+        *,
+        prior_summary_override: PriorSummary | None | object = _UNSET,
+    ) -> RuntimeContext:
         """构造本轮 :class:`RuntimeContext`（预算快照 + 当前 llm_client）。
 
         ``llm_client`` per-call 传入 → ``switch_model`` 后自动跟随新客户端 / 新窗口。
@@ -736,12 +1098,22 @@ class Conversation:
         return RuntimeContext(
             budget=budget,
             llm_client=self._llm_client,
-            prior_summary=self._derive_prior_summary(),
+            prior_summary=self._derive_prior_summary()
+            if prior_summary_override is _UNSET
+            else cast(PriorSummary | None, prior_summary_override),
         )
 
     def _derive_prior_summary(self) -> PriorSummary | None:
         """从最近一条 ``compaction`` 事件派生 :class:`PriorSummary`（无则 ``None``）。"""
-        comp = self._session.latest_compaction()
+        return self._derive_prior_summary_from_events(self._session.active_events)
+
+    def _derive_prior_summary_from_events(self, events: list[Event]) -> PriorSummary | None:
+        """从给定事件流里最近一条 ``compaction`` 派生 :class:`PriorSummary`。"""
+        comp: Event | None = None
+        for ev in reversed(events):
+            if ev.type == "compaction":
+                comp = ev
+                break
         if comp is None:
             return None
         summary = comp.payload.get("summary", "")
@@ -863,7 +1235,13 @@ class Conversation:
             result.append({"id": slot["id"], "name": slot["name"], "args": args})
         return result
 
-    def _invoke_tool_safely(self, name: str, args: dict[str, Any]) -> ToolResult:
+    def _invoke_tool_safely(
+        self,
+        name: str,
+        args: dict[str, Any],
+        *,
+        current_turn_start_idx: int | None = None,
+    ) -> ToolResult:
         """调一次工具，把所有异常转为 :class:`ToolResult` ``is_error=True``。
 
         014 起：如果构造时注入了 ``tool_hook_invoker``（AgentRuntime 装配时传入），
@@ -884,7 +1262,12 @@ class Conversation:
 
         def _default_invoke() -> ToolResult:
             try:
-                return registry.invoke(name, args)
+                invocation_args = self._tool_args_with_invocation_context(
+                    name,
+                    args,
+                    current_turn_start_idx=current_turn_start_idx,
+                )
+                return registry.invoke(name, invocation_args)
             except Exception as exc:
                 return ToolResult(
                     text=f"工具 {name!r} 执行出错: {exc}",
@@ -894,6 +1277,23 @@ class Conversation:
         if self._tool_hook_invoker is not None:
             return self._tool_hook_invoker(name, args, _default_invoke)
         return _default_invoke()
+
+    def _tool_args_with_invocation_context(
+        self,
+        name: str,
+        args: dict[str, Any],
+        *,
+        current_turn_start_idx: int | None,
+    ) -> dict[str, Any]:
+        """给内置工具补运行时隐藏上下文；不改变 LLM 原始 tool args。"""
+        if name != _RECALL_PAST_CHATS_TOOL_NAME or current_turn_start_idx is None:
+            return args
+
+        return {
+            **args,
+            _CURRENT_SESSION_ID_ARG: self._session.session_id,
+            _CURRENT_TURN_START_INDEX_ARG: current_turn_start_idx,
+        }
 
     def _finalize_on_tool_loop_limit(
         self,
@@ -948,6 +1348,7 @@ class Conversation:
         user_input: str,
         user_event_appended: bool,
         current_text_buf: list[str],
+        current_text_persisted: bool,
         persona_name: str,
         persona_id: str | None,
         model_snapshot: str,
@@ -959,6 +1360,9 @@ class Conversation:
         - 否则把当前轮已经累积的部分文本落为 ``partial=True`` 的 assistant_event；
           已成功完成的前几轮 tool 调用事件不受影响
         """
+        if current_text_persisted:
+            return
+
         if not user_event_appended:
             if not current_text_buf:
                 return  # 完全没启动，不落盘

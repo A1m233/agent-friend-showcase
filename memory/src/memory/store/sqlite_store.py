@@ -88,6 +88,12 @@ class SqliteMemoryStore:
             logger.exception("sqlite store initialization failed for %s", db_path)
             raise
 
+    def warmup(self) -> None:
+        """Warm tokenizer and SQLite read path without writing user data."""
+        _tokenize("语音通话 warmup")
+        with self._lock:
+            self._conn.execute("SELECT 1").fetchone()
+
     # ----- 写 -----
 
     def add_semantic(self, row: SemanticRow) -> None:
@@ -184,6 +190,91 @@ class SqliteMemoryStore:
                 self._conn.commit()
         except sqlite3.Error:
             logger.exception("add_episodic failed id=%s owner=%s", row.id, row.owner_user_id)
+            raise
+
+    def soft_delete_by_source_events(
+        self,
+        *,
+        session_id: str,
+        event_uuids: set[str],
+        deleted_at: datetime,
+    ) -> dict[str, int]:
+        """软删除来源命中指定 session event 的记忆。
+
+        情节记忆按 ``source_ref`` 的首尾事件 uuid 匹配；语义记忆按
+        ``provenance`` 中被软删的 episodic id 匹配。语义层不排除 pinned，避免旧
+        分支抽取出的高优先级事实继续召回。
+        """
+        if not session_id or not event_uuids:
+            return {"episodic": 0, "semantic": 0}
+
+        deleted_at_s = serialize_ts(deleted_at)
+        try:
+            with self._lock:
+                episodic_rows = self._conn.execute(
+                    """
+                    SELECT id, source_ref FROM episodic
+                    WHERE deleted_at IS NULL AND source_ref LIKE ?
+                    """,
+                    (f"{session_id}#%",),
+                ).fetchall()
+                episodic_ids = [
+                    str(row["id"])
+                    for row in episodic_rows
+                    if _source_ref_touches(str(row["source_ref"]), session_id, event_uuids)
+                ]
+
+                episodic_count = 0
+                if episodic_ids:
+                    placeholders = ",".join("?" for _ in episodic_ids)
+                    cur = self._conn.execute(
+                        f"""
+                        UPDATE episodic SET deleted_at = ?
+                        WHERE deleted_at IS NULL AND id IN ({placeholders})
+                        """,
+                        [deleted_at_s, *episodic_ids],
+                    )
+                    episodic_count = cur.rowcount
+
+                semantic_count = 0
+                if episodic_ids:
+                    episodic_id_set = set(episodic_ids)
+                    semantic_rows = self._conn.execute(
+                        """
+                        SELECT id, provenance FROM semantic
+                        WHERE deleted_at IS NULL AND valid_until IS NULL
+                        """
+                    ).fetchall()
+                    semantic_ids: list[str] = []
+                    for row in semantic_rows:
+                        try:
+                            provenance = json.loads(row["provenance"])
+                        except (TypeError, json.JSONDecodeError):
+                            provenance = []
+                        if isinstance(provenance, list) and any(
+                            isinstance(item, str) and item in episodic_id_set for item in provenance
+                        ):
+                            semantic_ids.append(str(row["id"]))
+
+                    if semantic_ids:
+                        placeholders = ",".join("?" for _ in semantic_ids)
+                        cur = self._conn.execute(
+                            f"""
+                            UPDATE semantic SET deleted_at = ?, updated_at = ?
+                            WHERE deleted_at IS NULL AND id IN ({placeholders})
+                            """,
+                            [deleted_at_s, deleted_at_s, *semantic_ids],
+                        )
+                        semantic_count = cur.rowcount
+
+                self._conn.commit()
+                return {"episodic": episodic_count, "semantic": semantic_count}
+        except sqlite3.Error:
+            logger.exception(
+                "soft_delete_by_source_events failed session=%s events=%d",
+                session_id,
+                len(event_uuids),
+            )
             raise
 
     # ----- 读 -----
@@ -369,6 +460,18 @@ class SqliteMemoryStore:
         """关闭连接。"""
         with self._lock:
             self._conn.close()
+
+
+def _source_ref_touches(source_ref: str, session_id: str, event_uuids: set[str]) -> bool:
+    """判断 ``source_ref`` 的事件端点是否命中给定 uuid 集合。"""
+    prefix = f"{session_id}#"
+    if not source_ref.startswith(prefix):
+        return False
+    tail = source_ref[len(prefix) :]
+    if not tail:
+        return False
+    start, sep, end = tail.partition("..")
+    return start in event_uuids or (bool(sep) and end in event_uuids)
 
 
 # ----- 行映射 -----

@@ -3,13 +3,16 @@ use std::sync::{Arc, Mutex};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    Emitter, Manager, WebviewWindow,
+    Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 
 mod bubble_window;
-mod log_paths;
+mod paths;
 mod push_subscriber;
 mod settings;
+mod ui_state;
+
+const EVENT_WINDOW_SHOWN: &str = "window://shown";
 
 // 0004 / 017 · pet 窗 NSPanel 类型声明（macOS only）。
 //
@@ -236,6 +239,7 @@ fn show_and_focus(app: &tauri::AppHandle, label: &'static str) -> Result<(), Str
     let app_clone = app.clone();
     app.run_on_main_thread(move || {
         if let Some(w) = app_clone.get_webview_window(label) {
+            log::info!("show_and_focus: window={label} requested");
             #[cfg(target_os = "macos")]
             {
                 use objc2::{class, msg_send, runtime::AnyObject};
@@ -249,8 +253,19 @@ fn show_and_focus(app: &tauri::AppHandle, label: &'static str) -> Result<(), Str
                     }
                 }
             }
-            let _ = w.show();
-            let _ = w.set_focus();
+            match w.show() {
+                Ok(()) => log::info!("show_and_focus: window={label} show ok"),
+                Err(e) => log::warn!("show_and_focus: window={label} show failed: {e}"),
+            }
+            match w.set_focus() {
+                Ok(()) => log::info!("show_and_focus: window={label} focus ok"),
+                Err(e) => log::warn!("show_and_focus: window={label} focus failed: {e}"),
+            }
+            if let Err(e) = app_clone.emit_to(label, EVENT_WINDOW_SHOWN, ()) {
+                log::warn!("show_and_focus: window={label} emit shown failed: {e}");
+            }
+        } else {
+            log::warn!("show_and_focus: window={label} not found");
         }
     })
     .map_err(|e| e.to_string())?;
@@ -268,11 +283,48 @@ fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
     show_and_focus(&app, "settings")
 }
 
+/// 029 · 打开独立语音通话小窗。
+#[tauri::command]
+fn open_voice_call(app: tauri::AppHandle) -> Result<(), String> {
+    show_and_focus(&app, "voice-call")
+}
+
 /// 026 · dev 模式入口：打开记忆面板窗口。
 #[cfg(debug_assertions)]
 #[tauri::command]
 fn open_memory_inspector(app: tauri::AppHandle) -> Result<(), String> {
     show_and_focus(&app, "memory-inspector")
+}
+
+/// 033 · dev-only Live2D 调试器窗口。
+///
+/// 只在 debug build 注册 command；窗口在 setup 主线程预建为隐藏窗口，避免 Windows
+/// WebView2 从 command 动态创建时卡在 about:blank。
+#[cfg(debug_assertions)]
+#[tauri::command]
+fn open_live2d_debugger(app: tauri::AppHandle) -> Result<(), String> {
+    log::info!("open_live2d_debugger: showing live2d-debugger window");
+    show_and_focus(&app, "live2d-debugger")
+}
+
+#[cfg(debug_assertions)]
+fn setup_live2d_debugger_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+    if app.get_webview_window("live2d-debugger").is_some() {
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(
+        app,
+        "live2d-debugger",
+        WebviewUrl::App("live2d-debugger.html".into()),
+    )
+    .title("agent-friend · Live2D 调试器")
+    .inner_size(460.0, 680.0)
+    .min_inner_size(380.0, 520.0)
+    .resizable(true)
+    .visible(false)
+    .build()?;
+    log::info!("live2d-debugger window initialized");
+    Ok(())
 }
 
 /// 019 · 桌宠 ActionBar "隐藏桌宠" 按钮调用。语义：单向隐藏（不切换）。
@@ -420,11 +472,15 @@ pub fn run() {
     let builder = builder.invoke_handler(tauri::generate_handler![
         open_chat,
         open_settings,
+        open_voice_call,
         open_memory_inspector,
+        open_live2d_debugger,
         hide_pet,
         set_pet_webview_dpr,
         settings::get_setting,
         settings::set_setting,
+        ui_state::get_chat_ui_persistence,
+        ui_state::set_last_chat_session_id,
         bubble_window::show_bubble,
         bubble_window::hide_bubble,
         bubble_window::set_bubble_size,
@@ -435,10 +491,13 @@ pub fn run() {
     let builder = builder.invoke_handler(tauri::generate_handler![
         open_chat,
         open_settings,
+        open_voice_call,
         hide_pet,
         set_pet_webview_dpr,
         settings::get_setting,
         settings::set_setting,
+        ui_state::get_chat_ui_persistence,
+        ui_state::set_last_chat_session_id,
         bubble_window::show_bubble,
         bubble_window::hide_bubble,
         bubble_window::set_bubble_size,
@@ -447,10 +506,13 @@ pub fn run() {
 
     builder
         .on_window_event(|window, event| {
-            // 对话窗 / 设置窗 / 记忆面板按需显隐：点关闭只隐藏不销毁，便于再次打开。
+            // 对话窗 / 设置窗 / dev 工具窗按需显隐：点关闭只隐藏不销毁，便于再次打开。
             // 019 · settings 窗加入复用 chat 同款"关闭即隐藏"语义。
             // 026 · memory-inspector 窗同语义。
-            if matches!(window.label(), "chat" | "settings" | "memory-inspector") {
+            if matches!(
+                window.label(),
+                "chat" | "settings" | "voice-call" | "memory-inspector" | "live2d-debugger"
+            ) {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     let _ = window.hide();
@@ -458,7 +520,7 @@ pub fn run() {
             }
         })
         .setup(move |app| {
-            let log_dir = log_paths::log_dir();
+            let log_dir = paths::log_dir();
             std::fs::create_dir_all(&log_dir).ok();
             app.handle().plugin(
                 tauri_plugin_log::Builder::new()
@@ -531,6 +593,8 @@ pub fn run() {
                     apply_pet_nspanel(&pet);
                 }
             }
+            #[cfg(debug_assertions)]
+            setup_live2d_debugger_window(app.handle())?;
             // 016 · M16.3 透明窗 workaround + M16.4 跟随轮询 spawn；M16.5 内部对 bubble 窗也调 apply_floating_window_level
             bubble_window::init(app.handle())?;
             Ok(())

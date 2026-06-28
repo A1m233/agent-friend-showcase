@@ -24,10 +24,12 @@ from pydantic import BaseModel, Field
 from ..assembly import VoiceBridgeRuntime
 from ..calls import CallBinding
 from ..errors import UnknownCallError, VoiceBridgeError
+from ..latency import log_latency, monotonic_ms
 from ..rtc import build_scenes
 from ..rtc.token import RoomTokenSigner
 
 logger = logging.getLogger(__name__)
+_DIALOG_EVENT_TYPES = {"user_message", "assistant_message"}
 
 
 class StartCallBody(BaseModel):
@@ -39,6 +41,7 @@ class StartCallBody(BaseModel):
     welcome_message: str | None = Field(
         None, description="覆盖默认欢迎语；不传走 settings.welcome_message"
     )
+    trace_id: str | None = Field(None, description="端到端 latency trace id；不传则回退到 call_id")
     defer_start: bool = Field(
         False,
         description="仅 smoke 调试用：先返回 RTC 凭证，等浏览器入房开麦后再启动 AIGC",
@@ -55,6 +58,7 @@ class StartCallResponse(BaseModel):
     room_id: str
     user_id: str
     token: str
+    trace_id: str
 
 
 class CallStateResponse(BaseModel):
@@ -90,6 +94,21 @@ def register_control_routes(app: FastAPI, runtime: VoiceBridgeRuntime) -> None:
         welcome_message: str | None,
     ) -> None:
         """按已登记的 call binding 拉起火山 RTC AIGC 任务。"""
+        logger.info(
+            "voice start_agent call_id=%s session_id=%s room_id=%s",
+            binding.call_id,
+            binding.session_id,
+            binding.room_id,
+        )
+        started_ms = monotonic_ms()
+        log_latency(
+            logger,
+            "start_voice_chat_begin",
+            call_id=binding.call_id,
+            session_id=binding.session_id,
+            trace_id=binding.trace_id or binding.call_id,
+            room_id=binding.room_id,
+        )
         scenes = build_scenes(
             settings=runtime.settings,
             call_id=binding.call_id,
@@ -100,12 +119,65 @@ def register_control_routes(app: FastAPI, runtime: VoiceBridgeRuntime) -> None:
         )
         await runtime.rtc_client.start_voice_chat(scenes)
         runtime.call_registry.update_state(binding.call_id, "active")
+        log_latency(
+            logger,
+            "start_voice_chat_ok",
+            call_id=binding.call_id,
+            session_id=binding.session_id,
+            trace_id=binding.trace_id or binding.call_id,
+            elapsed_ms=monotonic_ms() - started_ms,
+        )
+
+    async def cleanup_empty_created_session(binding: CallBinding) -> None:
+        """删除 voice_bridge 自建且没有实际对话消息的空 session。"""
+        if not binding.created_session:
+            return
+
+        try:
+            events = await runtime.agent_bridge.get_session_events(binding.session_id)
+        except VoiceBridgeError as e:
+            logger.warning(
+                "读取语音临时 session 失败，跳过空会话清理: call_id=%s session_id=%s error=%s",
+                binding.call_id,
+                binding.session_id,
+                e,
+            )
+            return
+
+        has_dialog = any(event.get("type") in _DIALOG_EVENT_TYPES for event in events)
+        if has_dialog:
+            return
+
+        try:
+            await runtime.agent_bridge.delete_session(binding.session_id)
+            logger.info(
+                "已清理空语音 session: call_id=%s session_id=%s",
+                binding.call_id,
+                binding.session_id,
+            )
+        except VoiceBridgeError as e:
+            logger.warning(
+                "清理空语音 session 失败: call_id=%s session_id=%s error=%s",
+                binding.call_id,
+                binding.session_id,
+                e,
+            )
 
     @router.post("/calls", response_model=StartCallResponse)
     async def start_call(body: StartCallBody) -> StartCallResponse:
         """拨打通话：创建/绑 session → 调火山 ``StartVoiceChat`` → 返回 RTC 凭证。"""
         settings = runtime.settings
+        start_ms = monotonic_ms()
+        request_trace_id = body.trace_id or ""
+        log_latency(
+            logger,
+            "start_call_inbound",
+            trace_id=request_trace_id or None,
+            has_session=body.session_id is not None,
+            defer_start=body.defer_start,
+        )
         try:
+            created_session = body.session_id is None
             if body.session_id is None:
                 created = await runtime.agent_bridge.create_session(
                     channel="voice",
@@ -118,6 +190,7 @@ def register_control_routes(app: FastAPI, runtime: VoiceBridgeRuntime) -> None:
                 session_id = body.session_id
 
             call_id = str(uuid4())
+            trace_id = request_trace_id or call_id
             room_id = f"room-{uuid4().hex[:12]}"
             bot_user_id = f"bot-{uuid4().hex[:8]}"
             target_user_id = f"user-{uuid4().hex[:8]}"
@@ -144,13 +217,31 @@ def register_control_routes(app: FastAPI, runtime: VoiceBridgeRuntime) -> None:
                 room_id=room_id,
                 bot_user_id=bot_user_id,
                 target_user_id=target_user_id,
+                created_session=created_session,
+                trace_id=trace_id,
             )
             runtime.call_registry.bind(binding)
+            logger.info(
+                "voice call created call_id=%s session_id=%s created_session=%s defer_start=%s",
+                call_id,
+                session_id,
+                created_session,
+                body.defer_start,
+            )
+            log_latency(
+                logger,
+                "call_created",
+                call_id=call_id,
+                session_id=session_id,
+                trace_id=trace_id,
+                created_session=created_session,
+                elapsed_ms=monotonic_ms() - start_ms,
+            )
             if not body.defer_start:
                 await start_voice_chat_for_binding(binding, welcome_message=body.welcome_message)
                 binding = runtime.call_registry.lookup(call_id) or binding
 
-            return StartCallResponse(
+            response = StartCallResponse(
                 call_id=call_id,
                 session_id=session_id,
                 state=binding.state,
@@ -158,9 +249,27 @@ def register_control_routes(app: FastAPI, runtime: VoiceBridgeRuntime) -> None:
                 room_id=room_id,
                 user_id=target_user_id,
                 token=token,
+                trace_id=trace_id,
             )
+            log_latency(
+                logger,
+                "start_call_response",
+                call_id=call_id,
+                session_id=session_id,
+                trace_id=trace_id,
+                state=binding.state,
+                elapsed_ms=monotonic_ms() - start_ms,
+            )
+            return response
         except VoiceBridgeError as e:
             logger.warning("拨打通话失败: %s", e)
+            log_latency(
+                logger,
+                "start_call_error",
+                trace_id=request_trace_id or None,
+                error=e.info.error_code,
+                elapsed_ms=monotonic_ms() - start_ms,
+            )
             raise HTTPException(
                 status_code=e.info.http_status,
                 detail={"error": e.info.error_code, "message": e.info.user_message},
@@ -194,23 +303,45 @@ def register_control_routes(app: FastAPI, runtime: VoiceBridgeRuntime) -> None:
     @router.post("/callbacks/state/{call_id}")
     async def receive_state_callback(call_id: str, request: Request) -> dict[str, bool]:
         """火山 RTC 会话状态回调诊断入口。"""
+        received_ms = monotonic_ms()
         payload: Any
         try:
             payload = await request.json()
         except ValueError:
             payload = (await request.body()).decode("utf-8", errors="replace")
         logger.info("voice state callback call_id=%s payload=%s", call_id, payload)
+        binding = runtime.call_registry.lookup(call_id)
+        log_latency(
+            logger,
+            "volc_state_callback",
+            call_id=call_id,
+            session_id=binding.session_id if binding else None,
+            trace_id=(binding.trace_id or binding.call_id) if binding else None,
+            state=_extract_callback_stage(payload),
+            t_ms=received_ms,
+        )
         return {"ok": True}
 
     @router.post("/callbacks/subtitle/{call_id}")
     async def receive_subtitle_callback(call_id: str, request: Request) -> dict[str, bool]:
         """火山 RTC 字幕/ASR 回调诊断入口。"""
+        received_ms = monotonic_ms()
         payload: Any
         try:
             payload = await request.json()
         except ValueError:
             payload = (await request.body()).decode("utf-8", errors="replace")
         logger.info("voice subtitle callback call_id=%s payload=%s", call_id, payload)
+        binding = runtime.call_registry.lookup(call_id)
+        log_latency(
+            logger,
+            "volc_subtitle_callback",
+            call_id=call_id,
+            session_id=binding.session_id if binding else None,
+            trace_id=(binding.trace_id or binding.call_id) if binding else None,
+            stage=_extract_callback_stage(payload),
+            t_ms=received_ms,
+        )
         return {"ok": True}
 
     @router.get("/calls/{call_id}", response_model=CallStateResponse)
@@ -254,7 +385,27 @@ def register_control_routes(app: FastAPI, runtime: VoiceBridgeRuntime) -> None:
         except VoiceBridgeError as e:
             logger.warning("挂断时切回 text 通道失败（不阻断）: %s", e)
 
+        await cleanup_empty_created_session(binding)
         runtime.call_registry.update_state(call_id, "stopped")
         return StopCallResponse(call_id=call_id, state="stopped")
 
     app.include_router(router)
+
+
+def _extract_callback_stage(payload: Any) -> str:
+    """Best-effort extraction for volatile Volc callback payloads."""
+    if isinstance(payload, dict):
+        for key in ("stage", "state", "event", "type", "Status", "State", "Event"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return value
+        for value in payload.values():
+            nested = _extract_callback_stage(value)
+            if nested:
+                return nested
+    if isinstance(payload, list):
+        for item in payload:
+            nested = _extract_callback_stage(item)
+            if nested:
+                return nested
+    return ""

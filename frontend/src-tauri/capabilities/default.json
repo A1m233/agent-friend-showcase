@@ -7,7 +7,9 @@
     "chat",
     "bubble",
     "settings",
-    "memory-inspector"
+    "voice-call",
+    "memory-inspector",
+    "live2d-debugger"
   ],
   "permissions": [
     "core:default",

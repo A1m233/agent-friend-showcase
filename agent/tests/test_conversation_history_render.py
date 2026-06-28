@@ -48,6 +48,7 @@ def test_empty_hits_returns_persona_fallback() -> None:
     assert "不要凭通识" in text
     assert "补具体细节" in text
     assert "通用知识回答" in text
+    assert "web_search" in text
     # 不能出现技术化字眼
     for forbidden in ("No results", "找到 0", "session", "event"):
         assert forbidden not in text
@@ -164,8 +165,11 @@ def test_inline_reminder_at_end() -> None:
     # 关键引导词
     assert "朋友的口吻" in text
     assert "ISO 时间戳" in text or "时间戳" in text
+    assert "证据边界" in text
+    assert "事件日期" in text
+    assert "web_search" in text
     # reminder 应该是末尾
-    assert text.rstrip().endswith("之类的话。")
+    assert text.rstrip().endswith("补这个历史问题。")
 
 
 def test_inline_reminder_absent_when_empty() -> None:

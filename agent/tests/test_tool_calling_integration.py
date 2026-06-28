@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, cast
@@ -74,6 +74,24 @@ class FailingTool:
 
     def invoke(self, args: dict[str, Any]) -> ToolResult:
         raise RuntimeError("simulated tool crash")
+
+
+class SpyRecallTool:
+    """记录 ``recall_past_chats`` 的真实 invoke 入参，验证隐藏上下文注入。"""
+
+    name: ClassVar[str] = "recall_past_chats"
+    description: ClassVar[str] = "回忆过去和这位用户聊过的事。"
+    parameters_schema: ClassVar[dict[str, Any]] = {
+        "type": "object",
+        "properties": {"limit": {"type": "integer"}},
+    }
+
+    def __init__(self) -> None:
+        self.seen_args: list[dict[str, Any]] = []
+
+    def invoke(self, args: dict[str, Any]) -> ToolResult:
+        self.seen_args.append(dict(args))
+        return ToolResult(text="找到一些旧聊天。")
 
 
 # ---- Scripted fake LLM ----
@@ -223,6 +241,72 @@ def test_tool_call_happy_path(tmp_path: Path) -> None:
     assert len(assistant_msgs) == 1
     assert "tool_calls" in assistant_msgs[0]
     assert assistant_msgs[0]["tool_calls"][0]["id"] == "call_1"
+
+
+def test_recall_tool_receives_hidden_current_turn_context(tmp_path: Path) -> None:
+    """``recall_past_chats`` 执行时拿到当前 session / turn 起点，落盘参数仍保持原样。"""
+    recall = SpyRecallTool()
+    registry = ToolRegistry([recall])
+    fake = _ScriptedLLMClient(
+        script=[
+            [
+                LLMTextDelta(text="让我回忆一下。"),
+                LLMToolCallDelta(
+                    index=0,
+                    tool_call_id="call_recall",
+                    tool_name="recall_past_chats",
+                    args_json_delta=json.dumps({"limit": 10}),
+                ),
+                LLMTurnDone(stop_reason="tool_use"),
+            ],
+            [
+                LLMTextDelta(text="想起来了。"),
+                LLMTurnDone(stop_reason="end_turn"),
+            ],
+        ]
+    )
+    conv = _make_conversation(tmp_path, fake_llm=fake, registry=registry)
+
+    events = list(conv.stream("我们最近聊了啥？"))
+
+    assert len(recall.seen_args) == 1
+    invocation_args = recall.seen_args[0]
+    assert invocation_args["limit"] == 10
+    assert invocation_args["__agent_friend_current_session_id"] == conv.session.session_id
+    assert invocation_args["__agent_friend_current_turn_start_index"] == 1
+
+    tool_reqs = [ev for ev in events if isinstance(ev, ToolCallRequest)]
+    assert len(tool_reqs) == 1
+    assert tool_reqs[0].args == {"limit": 10}
+
+    request_event = next(ev for ev in conv.session.events if ev.type == "tool_call_request")
+    assert request_event.payload["args"] == {"limit": 10}
+
+
+def test_closing_stream_after_turndone_does_not_write_partial_duplicate(tmp_path: Path) -> None:
+    """消费方拿到 TurnDone 后关闭 generator，不应误落一条 partial=True 重复回复。"""
+    fake = _ScriptedLLMClient(
+        script=[
+            [
+                LLMTextDelta(text="完整回复"),
+                LLMTurnDone(stop_reason="end_turn"),
+            ]
+        ]
+    )
+    conv = _make_conversation(tmp_path, fake_llm=fake, registry=ToolRegistry([]))
+
+    stream = cast(Generator[Any, None, None], conv.stream("hi"))
+    first = next(stream)
+    done = next(stream)
+    assert isinstance(first, TextDelta)
+    assert isinstance(done, TurnDone)
+
+    stream.close()
+
+    assistant_events = [ev for ev in conv.session.events if ev.type == "assistant_message"]
+    assert len(assistant_events) == 1
+    assert assistant_events[0].payload["content"] == "完整回复"
+    assert assistant_events[0].payload["partial"] is False
 
 
 # ===== 失败兜底 =====

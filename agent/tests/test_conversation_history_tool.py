@@ -233,6 +233,74 @@ def test_limit_zero_clamped_to_one() -> None:
     assert result.meta["result_count"] == 1
 
 
+def test_hidden_current_turn_boundary_excludes_current_session_events() -> None:
+    prior_ts = _NOW - timedelta(hours=2)
+    session = _make_session(
+        "sess-current",
+        created_at=prior_ts - timedelta(seconds=10),
+        events_data=[
+            ("user_message", "今天下了好大雨", prior_ts),
+            ("assistant_message", "听起来雨势很大。", prior_ts + timedelta(seconds=30)),
+            ("user_message", "我们最近聊了啥？", _NOW - timedelta(seconds=50)),
+            ("assistant_message", "让我回忆一下最近的聊天内容。", _NOW - timedelta(seconds=40)),
+        ],
+    )
+    tool = _tool(_StubStore([session]))
+
+    result = tool.invoke(
+        {
+            "limit": 10,
+            "__agent_friend_current_session_id": "sess-current",
+            "__agent_friend_current_turn_start_index": 3,
+        }
+    )
+
+    assert result.meta is not None
+    assert result.meta["result_count"] == 2
+    assert "今天下了好大雨" in result.text
+    assert "雨势很大" in result.text
+    assert "我们最近聊了啥" not in result.text
+    assert "让我回忆一下" not in result.text
+
+
+def test_partial_and_empty_assistant_messages_do_not_consume_limit() -> None:
+    prior_ts = _NOW - timedelta(hours=2)
+    session = _make_session(
+        "sess-noisy",
+        created_at=prior_ts - timedelta(seconds=10),
+        events_data=[
+            ("user_message", "今天下了好大雨", prior_ts),
+            ("assistant_message", "别淋着，记得带伞。", prior_ts + timedelta(seconds=30)),
+        ],
+    )
+    events = list(session.events)
+    events.extend(
+        [
+            Event(
+                type="assistant_message",
+                uuid=str(uuid4()),
+                ts=prior_ts + timedelta(seconds=40),
+                payload={"content": "这句 partial 不该进 recall。", "partial": True},
+            ),
+            Event(
+                type="assistant_message",
+                uuid=str(uuid4()),
+                ts=prior_ts + timedelta(seconds=50),
+                payload={"content": "", "partial": False},
+            ),
+        ]
+    )
+    tool = _tool(_StubStore([Session.from_events(events)]))
+
+    result = tool.invoke({"limit": 1})
+
+    assert result.meta is not None
+    assert result.meta["result_count"] == 1
+    assert "别淋着" in result.text
+    assert "partial 不该进 recall" not in result.text
+    assert "：「」" not in result.text
+
+
 # ===== 失败路径 =====
 
 
